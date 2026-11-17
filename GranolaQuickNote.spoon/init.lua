@@ -20,7 +20,7 @@ obj.spoonPath = hs.spoons.scriptPath()
 --- GranolaQuickNote.config
 --- Variable
 --- Settings table; override with `:configure({...})` before `:start()`.
----  * keyCode (number|string) - key to capture. Default 176 (mic key on many Macs). A string
+---  * keyCode (number|string|table) - key to capture (or a list of keys). Default 176 (mic key on many Macs). A string
 ---    is looked up in hs.keycodes.map, e.g. "f19". See the README for finding your keycode.
 ---  * autoTranscribe (boolean) - start recording when the note opens. Default true.
 ---  * launchWaitSeconds (number) - how long to wait for Granola's window after launching it.
@@ -32,6 +32,10 @@ obj.spoonPath = hs.spoons.scriptPath()
 ---  * windowHelper (string) - path to the compiled app-windows helper. Default: bin/app-windows
 ---    inside the Spoon. If missing, only windows on visible Spaces can be found.
 ---  * focusAttempts / focusRetrySeconds (number) - how hard to try to focus the window.
+---  * moveWindowOnSwitchFail (boolean) - if switching Spaces keeps failing, pull Granola's
+---    window onto the current Space instead. Default false.
+---  * watchdogSeconds (number) - how often to check the key tap is still alive and restart
+---    it if macOS disabled it (e.g. after sleep). 0 disables. Default 5.
 ---  * logPath (string|nil) - log file. Default: granola_quick_note.log in your Hammerspoon
 ---    config folder. Set to false to disable logging.
 obj.defaults = {
@@ -46,7 +50,14 @@ obj.defaults = {
   focusAttempts = 8,
   focusRetrySeconds = 0.4,
   logPath = nil,
+  moveWindowOnSwitchFail = false,
+  watchdogSeconds = 5,
 }
+
+local KNOWN = {}
+for _, k in ipairs({ "keyCode", "autoTranscribe", "launchWaitSeconds", "launchSettleSeconds",
+  "cooldownSeconds", "bundleID", "url", "windowHelper", "focusAttempts", "focusRetrySeconds",
+  "logPath", "moveWindowOnSwitchFail", "watchdogSeconds" }) do KNOWN[k] = true end
 
 obj.cfg = {}
 for k, v in pairs(obj.defaults) do obj.cfg[k] = v end
@@ -61,15 +72,26 @@ obj.state = {
 obj.tap = nil
 
 function obj:configure(overrides)
-  for k, v in pairs(overrides or {}) do self.cfg[k] = v end
+  for k, v in pairs(overrides or {}) do
+    if not KNOWN[k] then
+      print("GranolaQuickNote: ignoring unknown option '" .. tostring(k) .. "'")
+    else
+      self.cfg[k] = v
+    end
+  end
   return self
 end
 
-local function resolveKeyCode(key)
-  if type(key) == "number" then return key end
-  local code = hs.keycodes.map[tostring(key):lower()]
-  if not code then error("GranolaQuickNote: unknown key '" .. tostring(key) .. "'") end
-  return code
+-- Accepts a number, a key name, or a list of either. Returns a set of keycodes, or nil, err.
+local function resolveKeyCodes(key)
+  local set = {}
+  for _, k in ipairs(type(key) == "table" and key or { key }) do
+    local code = type(k) == "number" and k or hs.keycodes.map[tostring(k):lower()]
+    if type(code) ~= "number" then return nil, "unknown key '" .. tostring(k) .. "'" end
+    set[code] = true
+  end
+  if next(set) == nil then return nil, "no key configured" end
+  return set
 end
 
 function obj:_url()
@@ -89,6 +111,8 @@ function obj:_log(message)
   local path = self.cfg.logPath
   if path == false then return end
   path = path or (hs.configdir .. "/granola_quick_note.log")
+  local size = hs.fs.attributes(path, "size")
+  if size and size > 256 * 1024 then os.rename(path, path .. ".1") end
   local file = io.open(path, "a")
   if file then
     file:write(os.date("%Y-%m-%d %H:%M:%S"), " ", message, "\n")
@@ -133,6 +157,11 @@ end
 -- then focus it.
 function obj:_bringForward(attempt)
   attempt = attempt or 1
+  local last = attempt >= self.cfg.focusAttempts
+  local function retry()
+    hs.timer.doAfter(self.cfg.focusRetrySeconds, function() self:_bringForward(attempt + 1) end)
+  end
+
   self:_findMainWindowID(function(windowID)
     local spaces = windowID and hs.spaces.windowSpaces(windowID) or {}
     local spaceID = spaces[1]
@@ -141,7 +170,17 @@ function obj:_bringForward(attempt)
       self:_log("window " .. windowID .. " on hidden " .. tostring(hs.spaces.spaceType(spaceID))
         .. " space " .. spaceID .. "; switching")
       local ok, err = hs.spaces.gotoSpace(spaceID)
-      if not ok then self:_log("gotoSpace failed: " .. tostring(err)) end
+      if not ok then
+        self:_log("gotoSpace failed: " .. tostring(err))
+        if not last then return retry() end
+        if self.cfg.moveWindowOnSwitchFail then
+          local screen = hs.screen.mainScreen()
+          local current = screen and hs.spaces.activeSpaceOnScreen(screen)
+          if current and hs.spaces.moveWindowToSpace(windowID, current) then
+            self:_log("moved window " .. windowID .. " to current space")
+          end
+        end
+      end
     end
 
     -- No Space at all: the window is hidden (closed to the menu bar). Unhide it.
@@ -153,20 +192,25 @@ function obj:_bringForward(attempt)
     local window = windowID and hs.window.get(windowID)
     if window then
       window:focus()
-      self.state.lastFocusResult = "focused window " .. windowID
-      self:_log(self.state.lastFocusResult .. " after attempt " .. attempt)
+      local front = hs.window.frontmostWindow()
+      if front and front:id() == windowID then
+        self.state.lastFocusResult = "focused window " .. windowID
+        self:_log(self.state.lastFocusResult .. " after attempt " .. attempt)
+        return
+      end
+      if not last then return retry() end
+      self.state.lastFocusResult = "window " .. windowID .. " not frontmost after " .. attempt
+        .. " attempts"
+      self:_log(self.state.lastFocusResult)
       return
     end
 
-    if attempt < self.cfg.focusAttempts then
-      hs.timer.doAfter(self.cfg.focusRetrySeconds, function() self:_bringForward(attempt + 1) end)
-    else
-      local app = hs.application.get(self.cfg.bundleID)
-      if app then app:activate(true) end
-      self.state.lastFocusResult = "fell back to activate (window " .. tostring(windowID)
-        .. ", space " .. tostring(spaceID) .. ")"
-      self:_log(self.state.lastFocusResult)
-    end
+    if not last then return retry() end
+    local app = hs.application.get(self.cfg.bundleID)
+    if app then app:activate(true) end
+    self.state.lastFocusResult = "fell back to activate (window " .. tostring(windowID)
+      .. ", space " .. tostring(spaceID) .. ")"
+    self:_log(self.state.lastFocusResult)
   end)
 end
 
@@ -203,6 +247,11 @@ end
 function obj:_open()
   local now = hs.timer.secondsSinceEpoch()
   if now - self.state.lastLaunchAt < self.cfg.cooldownSeconds then return end
+  if not hs.application.pathForBundleID(self.cfg.bundleID) then
+    self:_log("Granola not found for bundle ID " .. self.cfg.bundleID)
+    hs.alert.show("Granola is not installed", 2)
+    return
+  end
   self.state.lastLaunchAt = now
   hs.alert.show("Starting Granola Quick Note", 1)
 
@@ -221,15 +270,25 @@ end
 --- (dictation, Siri) sees it. Returns the Spoon.
 function obj:start()
   self:stop()
-  local keyCode = resolveKeyCode(self.cfg.keyCode)
-  self.cfg.resolvedKeyCode = keyCode
+  local keys, err = resolveKeyCodes(self.cfg.keyCode)
+  if not keys then
+    self:_log("not started: " .. err)
+    hs.alert.show("GranolaQuickNote: " .. err, 4)
+    print("GranolaQuickNote: not started: " .. err)
+    return self
+  end
+  self.keySet = keys
+  if hs.accessibilityState and not hs.accessibilityState() then
+    self:_log("Accessibility permission missing; key capture will not work")
+    hs.alert.show("GranolaQuickNote needs Accessibility access for Hammerspoon", 4)
+  end
   if not self:_helper() then
     self:_log("app-windows helper not built; only windows on visible Spaces can be found")
   end
   self.tap = hs.eventtap.new(
     { hs.eventtap.event.types.keyDown, hs.eventtap.event.types.keyUp },
     function(event)
-      if event:getKeyCode() ~= keyCode then return false end
+      if not keys[event:getKeyCode()] then return false end
       if event:getType() == hs.eventtap.event.types.keyDown
           and event:getProperty(hs.eventtap.event.properties.keyboardEventAutorepeat) == 0 then
         self.state.lastDetectedAt = hs.timer.secondsSinceEpoch()
@@ -238,6 +297,18 @@ function obj:start()
       return true
     end
   ):start()
+
+  -- macOS silently disables event taps after a timeout or around sleep/wake.
+  local every = self.cfg.watchdogSeconds
+  if every and every > 0 then
+    self.watchdog = hs.timer.doEvery(every, function()
+      if self.tap and not self.tap:isEnabled() then
+        self.tap:start()
+        self.state.tapRestarts = (self.state.tapRestarts or 0) + 1
+        self:_log("key tap was disabled; restarted (" .. self.state.tapRestarts .. ")")
+      end
+    end)
+  end
   return self
 end
 
@@ -245,6 +316,7 @@ end
 --- Method
 --- Stop capturing the key and give it back to macOS.
 function obj:stop()
+  if self.watchdog then self.watchdog:stop(); self.watchdog = nil end
   if self.tap then self.tap:stop(); self.tap = nil end
   return self
 end
@@ -258,7 +330,8 @@ function obj:status()
   return {
     loaded = self.tap ~= nil,
     enabled = self.tap and self.tap:isEnabled() or false,
-    keyCode = self.cfg.resolvedKeyCode,
+    keyCode = self.cfg.keyCode,
+    tapRestarts = s.tapRestarts or 0,
     helperBuilt = self:_helper() ~= nil,
     secondsSinceKeyDetected = s.lastDetectedAt and now - s.lastDetectedAt or nil,
     secondsSinceLastLaunch = s.lastLaunchAt > 0 and now - s.lastLaunchAt or nil,

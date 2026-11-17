@@ -47,7 +47,7 @@ spoon.GranolaQuickNote:configure({
 
 | Option | Default | |
 |---|---|---|
-| `keyCode` | `176` | Key to capture. A number is a raw keycode; a string is looked up in `hs.keycodes.map`. |
+| `keyCode` | `176` | Key to capture: a raw keycode, a key name (looked up in `hs.keycodes.map`), or a list of either. |
 | `autoTranscribe` | `true` | Adds `auto_transcribe=1` to the link so recording starts. |
 | `launchWaitSeconds` | `20` | Max wait for Granola's window on a cold start. After that the link is sent anyway. |
 | `launchSettleSeconds` | `1.5` | Pause after the window appears before sending the link. |
@@ -56,6 +56,8 @@ spoon.GranolaQuickNote:configure({
 | `url` | none | Replace the whole deep link (ignores `autoTranscribe`). |
 | `windowHelper` | `bin/app-windows` in the Spoon | Path to the compiled helper. |
 | `focusAttempts`, `focusRetrySeconds` | `8`, `0.4` | How hard to try to focus the window. |
+| `moveWindowOnSwitchFail` | `false` | If switching Spaces keeps failing, pull Granola's window onto the current Space instead. |
+| `watchdogSeconds` | `5` | Check that macOS hasn't silently disabled the key tap (it does this after some sleeps) and restart it. `0` turns it off. |
 | `logPath` | `granola_quick_note.log` in your Hammerspoon config folder | Set `false` to disable logging. |
 
 ### Finding your own keycode
@@ -95,6 +97,20 @@ Check the log file (see `logPath`). Common problems:
 - **Nothing happens after a cold start:** raise `launchWaitSeconds` / `launchSettleSeconds`.
 
 Careful: pressing the key really does start a recording. Use `focusTest()` when testing window focus.
+
+## Tests
+
+`tests/test_spoon.lua` runs the Spoon's logic against a mocked `hs`: cold start, launch timeout, double press, key repeat, Space switch failures, tap restart, bad config. It never touches Hammerspoon, Granola, or a deep link.
+
+```bash
+tests/run.sh      # needs a lua interpreter on PATH, e.g. brew install lua
+```
+
+## Known limits
+
+- The Spoon can't tell whether Granola is already recording. Pressing the key opens another new note, so presses within `cooldownSeconds` are dropped, but a press later during a recording starts a second note.
+- If Granola is running but still starting up (not yet signed in), the link can be dropped. Only a not-running Granola gets the wait-for-window treatment.
+- Only plain key events are captured, not system media keys.
 
 ## Status
 
